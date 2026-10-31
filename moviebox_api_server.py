@@ -22,6 +22,22 @@ from moviebox_api import MovieBoxClient, MovieBoxAuth, MovieBoxContent, MovieBox
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def is_deprecation_notice_url(url: Optional[str]) -> bool:
+    """Reject known placeholder/notice clips as non-playable media."""
+    if not url or not isinstance(url, str):
+        return True
+    normalized = url.lower()
+    blocked_patterns = (
+        "notice.mp4",
+        "macdn.aoneroom.com/other/",
+        "1c7de0bd3393702d9191801f15f88f8d",
+        "9a0461bc39da389663bf3dbb17091d3f",
+        "80da52722ee7de7a4303290af6783424",
+        "b164fbfb4347792950bdfbfb563d39d9",
+    )
+    return any(pattern in normalized for pattern in blocked_patterns)
+
 app = FastAPI(title="MovieBox Unofficial API Backend")
 
 
@@ -967,19 +983,6 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
     res_ep = None if is_movie else episode
     
 
-    # Helper: Detect fake/dummy upgrade notice clips (anti-piracy trap)
-    def is_deprecation_notice_url(u: str) -> bool:
-        if not u: return False
-        lower = u.lower()
-        return (
-            "notice.mp4" in lower
-            or ("macdn.aoneroom.com" in lower and "/other/" in lower)
-            or "1c7de0bd3393702d9191801f15f88f8d" in lower
-            or "9a0461bc39da389663bf3dbb17091d3f" in lower
-            or "80da52722ee7de7a4303290af6783424" in lower
-            or "b164fbfb4347792950bdfbfb563d39d9" in lower
-        )
-
     # 1. Primary: Try play-info/v2, then fallback to play-info
     res = s["stream"].get_play_info_v2(subject_id, season=res_se, episode=res_ep)
     data = res.get("data", {}) if isinstance(res, dict) else {}
@@ -992,59 +995,13 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
         streams = data.get("streamList") or data.get("streams") or []
     
     logger.info(f"PLAY-INFO RESPONSE: code={res.get('code')}, found {len(streams)} streams")
-
-    # 2. Episode Resource Mirrors via /resource/v2 with isVip=true spoofing
-    try:
-        r2_se = 0 if is_movie else season
-        r2_ep = 0 if is_movie else episode
-        res2 = s["stream"].get_resources_v2(subject_id, season=r2_se, episode=r2_ep)
-        r2_items = res2.get("data", {}).get("list") or []
-        for r_item in r2_items:
-            r_link = r_item.get("resourceLink") or r_item.get("downloadUrl") or r_item.get("url")
-            if r_link:
-                streams.append({
-                    "url": r_link,
-                    "quality": f"{r_item.get('resolution')}p" if r_item.get('resolution') else "Auto",
-                    "signCookie": r_item.get("signCookie") or "",
-                    "codec": r_item.get("codecName") or "",
-                    "id": str(r_item.get("resourceId") or ""),
-                    "duration": r_item.get("duration") or 0
-                })
-        if r2_items:
-            logger.info(f"Appended {len(r2_items)} mirror resources from /resource/v2 (isVip=true)")
-    except Exception as e:
-        logger.warning(f"Failed to fetch /resource/v2 mirrors: {e}")
-
-    # 3. Detect anti-piracy trap clips and recover original media file via /resource-position/v2
-    recovered_streams = []
-    for _st in streams:
-        st_url = _st.get("url", "")
-        st_rid = str(_st.get("id") or "")
-        if is_deprecation_notice_url(st_url) and st_rid:
-            logger.info(f"Detected anti-piracy dummy video clip for resource {st_rid}. Engaging /resource-position/v2 failover...")
-            try:
-                rec_res = s["stream"].recover_resource_position_v2(subject_id, st_rid, st_url)
-                rec_list = rec_res.get("data", {}).get("list") or []
-                if rec_list:
-                    rec_item = rec_list[0]
-                    real_link = rec_item.get("resourceLink") or rec_item.get("url")
-                    if real_link and not is_deprecation_notice_url(real_link):
-                        logger.info(f"FAILOVER SUCCESS: Recovered real stream link: {real_link[:60]}...")
-                        recovered_streams.append({
-                            "url": real_link,
-                            "quality": f"{rec_item.get('resolution')}p" if rec_item.get('resolution') else _st.get("quality", "Auto"),
-                            "signCookie": rec_item.get("signCookie") or _st.get("signCookie") or "",
-                            "codec": rec_item.get("codecName") or _st.get("codec", ""),
-                            "id": str(rec_item.get("resourceId") or st_rid),
-                            "duration": rec_item.get("duration") or _st.get("duration", 0)
-                        })
-            except Exception as re_err:
-                logger.warning(f"Recovery via /resource-position/v2 failed: {re_err}")
-        elif not is_deprecation_notice_url(st_url):
-            recovered_streams.append(_st)
-
-    if recovered_streams:
-        streams = recovered_streams
+    streams = [
+        st for st in streams
+        if isinstance(st, dict)
+        and isinstance(st.get("url"), str)
+        and st.get("url")
+        and not is_deprecation_notice_url(st.get("url"))
+    ]
 
     # Fallback to resourceDetectors inside movie/show detail if no streams found
     if not streams:
@@ -1095,7 +1052,7 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
     # We strictly prioritize H.264 (AVC) MP4 > HLS > (Anything else).
     
     def prioritize_h264(st):
-        u = st.get("url", "").lower()
+        u = str(st.get("url") or "").lower()
         if "h265" in u or "x265" in u or "hev1" in u: return 10 # Very low priority
         if ".mp4" in u: return 0  # Highest priority
         if ".m3u8" in u: return 1 # Good priority
@@ -1106,7 +1063,7 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
     # Pass 1: Try to find a playable non-HEVC stream
     for st in prioritized_streams:
         url = st.get("url")
-        if not url: continue
+        if not isinstance(url, str) or not url: continue
         if any(bad in url.lower() for bad in ["h265", "x265", "hev1"]):
             continue
         cookie = st.get("signCookie") or global_cookie or ""
@@ -1122,7 +1079,7 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
     if not working_stream:
         for st in prioritized_streams:
             url = st.get("url")
-            if not url: continue
+            if not isinstance(url, str) or not url: continue
             cookie = st.get("signCookie") or global_cookie or ""
             try:
                 head_res = requests.head(url, headers={"User-Agent": "ExoPlayerLib/2.18.7", "Cookie": cookie}, timeout=3, verify=False)
@@ -1134,183 +1091,31 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
             except: continue
     subtitles_source = data.get("subTitleList", [])
     
-    # PROIRITY: Resource Mirrors (UGC/Dubs like eyosi_as_iam)
+    # Alternate resource-mirror probing is intentionally disabled.
+    # Only normal play-info and published subject resourceDetectors are used.
+
+    # Do not overwrite a validated stream with an untested HEVC candidate.
+
     if not working_stream:
-        logger.info(f"Primary Cloud Offline for {subject_id}. Engaing Resource Mirror Rotation...")
-        try:
-            hdrs = {
-                "User-Agent": "MovieBox/4.0.02 (Android 14; Pixel 6)",
-                "X-M-Version": "4.0.02"
+        logger.error(f"RESOLUTION FAILURE: No legitimate playable streams found for subject {subject_id}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "LEGITIMATE_STREAM_UNAVAILABLE",
+                "message": "No legitimate playable stream is currently available."
             }
-            
-            # PHASE 1: Resource Discovery via Metadata (High Parity with Subtitles)
-            r_ids = []
-            try:
-                det_res = s["client"].request('GET', '/wefeed-mobile-bff/subject-api/get', params={'subjectId': subject_id}, headers=hdrs)
-                logger.info(f"Metadata Probe Result: {det_res.get('code')} - {len(det_res.get('data', {}).get('resourceDetectors', []))} detectors found")
-                detectors = (det_res.get('data') or {}).get('resourceDetectors') or []
-                for d in detectors:
-                    if d.get('resourceId'): r_ids.append(d.get('resourceId'))
-            except Exception as ex: 
-                logger.error(f"Metadata Probe Crash: {ex}")
+        )
 
-            # PHASE 2: Fallback to See-List (UGC Discoverability)
-            if not r_ids:
-                try:
-                    res_list = s["client"].request('GET', '/wefeed-mobile-bff/subject-api/see-list-v2', params={'subjectId': subject_id, 'page': 1, 'pageSize': 20, 'seeType': 1}, headers=hdrs)
-                    logger.info(f"See-List Probe Result: {res_list.get('code')}")
-                    r_items = (res_list.get('data') or {}).get('items') or []
-                    for item in r_items:
-                        if item.get('id'): r_ids.append(item.get('id'))
-                except: pass
-
-            # PHASE 3: Iterative Recovery
-            for r_id in r_ids:
-                logger.info(f"Probing Resource: {r_id} for {subject_id}")
-                # USE BOTH FULL AND ABBREVIATED PARAMS
-                # ALSO PROBE WITHOUT QUALITY (UGC often fails if quality mismatch)
-                p_params = {
-                    'subjectId': subject_id, 
-                    'resourceId': r_id
-                }
-                if not is_movie:
-                    p_params.update({'se': season, 'ep': episode, 'season': season, 'episode': episode})
-                
-                # First attempt: With quality
-                q_params = p_params.copy()
-                q_params['quality'] = official_quality
-                p_info = s["client"].request('GET', '/wefeed-mobile-bff/subject-api/play-info', params=q_params, headers=hdrs)
-                p_data = p_info.get('data') or {}
-                p_streams = p_data.get('streamList') or p_data.get('streams') or []
-                
-                # Second attempt: Without quality (Discovery mode)
-                if not p_streams:
-                    logger.info(f"Retrying probe {r_id} without quality constraint...")
-                    p_info = s["client"].request('GET', '/wefeed-mobile-bff/subject-api/play-info', params=p_params, headers=hdrs)
-                    p_data = p_info.get('data') or {}
-                    p_streams = p_data.get('streamList') or p_data.get('streams') or []
-
-                logger.info(f"Probe {r_id} Result: {len(p_streams)} streams recovered")
-                if p_streams:
-                    working_stream = p_streams[0]
-                    
-                    # PROACTIVE PING: Force a session handshake with the media CDN
-                    if "hakunaymatata" in working_stream.get("url", ""):
-                        try:
-                            import requests
-                            logger.info(f"Ping session for CDN handshake: {working_stream.get('url')[:60]}")
-                            # Matches Android okhttp behavior: HEAD with timeout
-                            requests.head(working_stream.get("url"), headers={"User-Agent": "ExoPlayerLib/2.19.1"}, timeout=3, cookies=s["client"].session.cookies)
-                        except: pass
-
-                    # DEEP CAPTURE: Check body, then individual stream, then session cookies, then fallback
-                    working_cookie = (
-                        p_info.get('signCookie') or 
-                        p_data.get('signCookie') or 
-                        working_stream.get('signCookie') or # EMBEDDED IN STREAM OBJECT (CRITICAL)
-                        s["client"].session.cookies.get("signCookie") or 
-                        global_cookie or ""
-                    )
-                    
-                    # If still NO cookie for a protected CDN, we have a failover issue
-                    if not working_cookie and "hakunaymatata" in working_stream.get("url", ""):
-                        logger.warning("PROTECTED CDN DETECTED WITH NO COOKIE AFTER PING! Attempting session flush...")
-                        working_cookie = s["client"].session.cookies.get("signCookie") or ""
-
-                    subtitles_source = p_data.get("subTitleList", []) or subtitles_source
-                    logger.info(f"RESOURCE MIRROR SUCCESS: Recovered stream via User-Resource {r_id} (Cookie: {'YES' if working_cookie else 'NO'})")
-                    break
-        except Exception as e:
-            logger.warning(f"Resource Mirror Lookup Failed: {e}")
-
-    # PROACTIVE AUTO-FAILOVER: Scan for HEVC/H.265 and trigger transcode 
-    # Browser standard support is H.264 (AVC) and VP9/AV1.
-    is_hevc = any("h265" in st.get("url", "").lower() or "x265" in st.get("url", "").lower() or "hev1" in st.get("url", "").lower() or "h.265" in st.get("url", "").lower() for st in streams)
-    
-    # We also check for 'hev1' codec signatures in manifest URLs if found
-    h265_candidate = next((st for st in streams if any(bad in st.get("url", "").lower() for bad in ["h265", "x265", "hev1", "h.265"])), None)
-    
-    if is_hevc and h265_candidate:
-        logger.info(f"Detected HEVC/H.265. Directly serving RAW stream for Native Player support...")
-        working_stream = h265_candidate
-        working_cookie = working_stream.get("signCookie") or global_cookie or ""
-
-    # SECONDARY FALLBACK: API Cluster Rotation
-    if not working_stream:
-        logger.info(f"Entering Phase 4 Cluster Rotation for {subject_id}")
-        
-        clusters = [
-            ("https://apig.inmoviebox.com", "/wefeed-mobile-bff/subject-api/play-info"),
-            ("https://api5.aoneroom.com", "/wefeed-mobile-bff/subject-api/play-info"),
-            ("https://api-sin.aoneroom.com", "/wefeed-mobile-bff/subject-api/play-info"),
-            ("https://v-ios.aoneroom.com", "/wefeed-mobile-bff/subject-api/play-info"),
-            ("https://h5-api.aoneroom.com", "/wefeed-h5api-bff/subject/detail-rec"),
-            ("https://h5.aoneroom.com", "/index/video/v_detail")
-        ]
-        
-        hdrs = {
-            "User-Agent": "MovieBox/4.0.02 (Android 14; Pixel 6)",
-            "X-M-Version": "4.0.02"
-        }
-        
-        orig_base = s["client"].BASE_URL
-        for cluster_url, endpoint in clusters:
-            try:
-                logger.info(f"ROTATING CLUSTER: {cluster_url} -> {endpoint}")
-                s["client"].BASE_URL = cluster_url
-                
-                # Standard params
-                pms = {'subjectId': subject_id, 'se': season, 'ep': episode, 'quality': official_quality}
-                if "detail-rec" in endpoint:
-                    pms["perPage"] = 12
-                    pms["page"] = 1
-                
-                method = 'POST' if "v_detail" in endpoint else 'GET'
-                
-                fb_res = s["client"].request(method, endpoint, params=pms if method=='GET' else None, data=pms if method=='POST' else None, headers=hdrs)
-                if not isinstance(fb_res, dict):
-                    logger.warning(f"Cluster {cluster_url} returned invalid response type: {type(fb_res)}")
-                    continue
-                fb_data = fb_res.get('data', {})
-                srcs = fb_data.get('streamList') or fb_data.get('streams') or []
-                
-                if not srcs and "detail-rec" in endpoint:
-                    items = fb_data.get('items') or []
-                    if items:
-                         # Try to find a playable resource in items
-                         logger.info(f"H5 Detail contains {len(items)} sibling items, probing first...")
-                
-                logger.info(f"Cluster {cluster_url} Result: {len(srcs)} streams found")
-                
-                # Handshake validation for any candidate found
-                if not srcs and fb_data.get('url'): srcs = [fb_data]
-                
-                for cand in srcs:
-                    url = cand.get('url')
-                    if not url: continue
-                    cookie = cand.get('signCookie') or fb_res.get('signCookie') or fb_data.get('signCookie') or s["client"].session.cookies.get("signCookie") or global_cookie or ""
-                    try:
-                        v_res = requests.head(url, headers={"User-Agent": "ExoPlayerLib/2.18.7", "Cookie": cookie}, timeout=3, verify=False)
-                        if v_res.status_code in [200, 206]:
-                            working_stream = cand
-                            working_cookie = cookie
-                            subtitles_source = fb_data.get("subTitleList", []) or subtitles_source
-                            logger.info(f"CLUSTER SUCCESS: Recovered stream via {cluster_url} Cluster")
-                            break
-                    except: continue
-                if working_stream: break
-            except Exception as e:
-                logger.warning(f"Cluster {cluster_url} failed: {e}")
-            finally:
-                s["client"].BASE_URL = orig_base
-    
-    if not working_stream and streams:
-        working_stream = streams[0]
-        working_cookie = working_stream.get("signCookie") or global_cookie or ""
-
-    if not working_stream:
-        logger.error(f"RESOLUTION FAILURE: No usable streams found for subject {subject_id}")
-        raise HTTPException(status_code=404, detail="No streams found.")
+    selected_url = str(working_stream.get("url") or "")
+    if not selected_url or is_deprecation_notice_url(selected_url):
+        logger.warning("Rejected empty or placeholder stream for subject %s", subject_id)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "LEGITIMATE_STREAM_UNAVAILABLE",
+                "message": "No legitimate playable stream is currently available."
+            }
+        )
 
     # CALCULATE METADATA DURATION FOR FRONTEND OVERRIDE
     total_duration = 0
@@ -1478,33 +1283,43 @@ async def proxy_download(
 ):
     s = get_session(session_id)
     
-    # PRIORITY 1: Carrier 301 (Legacy Mirror) specifically for raw MP4s
-    logger.info(f"Targeting Carrier 301 Raw Mirrors for {subject_id}...")
-    c_res = s["client"].request('POST', '/index/video/v_detail', data={'subjectId': subject_id, 'carrier': '301', 'quality': quality})
-    data = c_res.get("data")
-    if not isinstance(data, dict): data = {}
-    streams = data.get("streamList") or data.get("streams") or []
-    
-    # PRIORITY 2: Mobile Protocol (DASH/HLS) if MP4 is missing
+    # Use the normal play-info contract; do not probe alternate carrier/mirror endpoints.
+    res = s["stream"].get_play_info_v2(subject_id, season=season, episode=episode)
+    data = res.get("data") if isinstance(res, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    streams = data.get("streams") or data.get("streamList") or []
+
     if not streams:
         res = s["stream"].get_play_info(subject_id, season=season, episode=episode)
-        data = res.get("data", {})
+        data = res.get("data") if isinstance(res, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
         streams = data.get("streamList") or data.get("streams") or []
-    
-    if not streams: 
-        raise HTTPException(status_code=404, detail="No downloadable mirrors found")
-    
-    match = None
-    for st in streams:
-        if ".mp4" in st.get("url", "").lower():
-            match = st
-            break
-    if not match: match = streams[0]
-            
-    url = match.get("url")
+
+    valid_streams = [
+        st for st in streams
+        if isinstance(st, dict)
+        and isinstance(st.get("url"), str)
+        and st.get("url")
+        and not is_deprecation_notice_url(st.get("url"))
+    ]
+    if not valid_streams:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "LEGITIMATE_STREAM_UNAVAILABLE",
+                "message": "No legitimate downloadable stream is currently available."
+            }
+        )
+
+    match = next(
+        (st for st in valid_streams if ".mp4" in str(st.get("url") or "").lower()),
+        valid_streams[0]
+    )
+    url = str(match.get("url") or "")
     cookie = data.get("signCookie") or match.get("signCookie") or ""
-    if not url: raise HTTPException(status_code=404)
-    
+
     clean_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
     
     # CASE 1: Native MP4 stream (Fully seekable via HTTPX byte ranges)
@@ -1514,9 +1329,18 @@ async def proxy_download(
         range_header = request.headers.get("Range")
         if range_header: req_hdrs["Range"] = range_header
             
-        client = httpx.AsyncClient(verify=False)
+        client = httpx.AsyncClient(verify=False, follow_redirects=True)
         req = client.build_request("GET", url, headers=req_hdrs)
         r = await client.send(req, stream=True)
+        if is_deprecation_notice_url(str(r.url)):
+            await r.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=503, detail="Upstream redirected to a placeholder/notice clip.")
+        if r.status_code >= 400:
+            upstream_status = r.status_code
+            await r.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=502, detail=f"Upstream download failed with HTTP {upstream_status}.")
         
         filename = f"{clean_title}_S{season}_E{episode}.mp4"
         headers = {
@@ -1534,7 +1358,7 @@ async def proxy_download(
             stream_generator(),
             status_code=r.status_code,
             headers={k: v for k, v in headers.items() if v},
-            background=httpx.AsyncClient().aclose
+            background=client.aclose
         )
         
     # CASE 2: DASH (.mpd) or HLS (.m3u8) needs FFMPEG demuxing
@@ -1723,6 +1547,8 @@ def report_progress(req: ProgressReport, session_id: Optional[str] = Cookie(None
 @app.post("/launch-player")
 def launch_player(player: str, url: str, cookie: Optional[str] = None, subject_id: Optional[str] = None, resource_id: Optional[str] = None, season: Optional[int] = None, episode: Optional[int] = None, title: Optional[str] = None, cover: Optional[str] = None, start_time: int = 0, subtitle_url: Optional[str] = None, duration: int = 0, session_id: Optional[str] = Cookie(None)):
     s = get_session(session_id)
+    if url and is_deprecation_notice_url(url):
+        raise HTTPException(status_code=400, detail="Refusing to launch a placeholder/notice clip.")
     # Record History!
     if subject_id:
         if not s["auth"].is_guest_mode:
@@ -1946,6 +1772,9 @@ def launch_player(
     subtitle_url: Optional[str] = Query(None),
     duration: Optional[int] = Query(0)
 ):
+    if is_deprecation_notice_url(url):
+        raise HTTPException(status_code=400, detail="Refusing to launch a placeholder/notice clip.")
+
     logger.info(f"Launching external player: {player} for url: {url[:100]}... (start_time: {start_time})")
     cmd = []
     if player.lower() == "mpv":
